@@ -42,6 +42,9 @@ class User(Base):
     mistake_journals = relationship("MistakeJournal", back_populates="user", cascade="all, delete-orphan")
     study_notes = relationship("StudyNote", back_populates="user", cascade="all, delete-orphan")
     tutor_bookmarks = relationship("TutorBookmark", back_populates="user", cascade="all, delete-orphan")
+    scheduler_preferences = relationship("SchedulerPreference", back_populates="user", cascade="all, delete-orphan")
+    scheduler_warnings = relationship("SchedulerWarning", back_populates="user", cascade="all, delete-orphan")
+    learning_objectives = relationship("LearningObjective", back_populates="user", cascade="all, delete-orphan")
 
     @property
     def college(self) -> str:
