@@ -262,7 +262,7 @@ class TutorBehaviorEngine:
     @classmethod
     def compose_tutor_prompt(
         cls,
-        config: TutorConfiguration,
+        config: 'TutorConfiguration',
         topic: str,
         user_answer: str = "",
     ) -> str:
@@ -335,7 +335,7 @@ NEVER deviate from this configuration. Every dimension MUST be visible in your r
         return prompt
 
     @classmethod
-    def build_evaluation_rubric(cls, config: TutorConfiguration) -> Dict[str, str]:
+    def build_evaluation_rubric(cls, config: 'TutorConfiguration') -> Dict[str, str]:
         """
         Build evaluation criteria based on study focus and personality.
         """
@@ -350,7 +350,7 @@ NEVER deviate from this configuration. Every dimension MUST be visible in your r
         }
 
     @classmethod
-    def validate_configuration(cls, config: TutorConfiguration) -> tuple[bool, List[str]]:
+    def validate_configuration(cls, config: 'TutorConfiguration') -> tuple:
         """
         Validate that configuration uses only valid values.
         """
@@ -382,7 +382,7 @@ NEVER deviate from this configuration. Every dimension MUST be visible in your r
         return len(errors) == 0, errors
 
     @classmethod
-    def get_valid_values(cls) -> Dict[str, List[str]]:
+    def get_valid_values(cls) -> Dict[str, List]:
         """Return all valid values for each knob (for frontend UI)."""
         return {
             "personalities": list(cls.PERSONALITY_PROFILES.keys()),

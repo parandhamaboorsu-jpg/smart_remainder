@@ -43,7 +43,7 @@ class SchedulerPreference(Base):
     # Long break duration (minutes)
     long_break_duration = Column(Integer, default=30)
 
-    # ─��� Subject preferences ──────────────────────────────────────────────────
+    # ── Subject preferences ──────────────────────────────────────────────────
     # Weak subjects (JSON list: ["DBMS", "Networking", ...])
     weak_subjects = Column(JSON, default=[])
 
