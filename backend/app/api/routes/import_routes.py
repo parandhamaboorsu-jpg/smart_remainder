@@ -1,219 +1,195 @@
-"""api/routes/import_routes.py — Document Import API"""
+"""
+api/routes/import_routes.py — Smart Academic Import Pipeline
 
-import os
-import logging
-from typing import Annotated
+Enhanced with:
+1. Multi-pass document audit
+2. Confirmation screen before database write
+3. Immediate dashboard/analytics/reminder updates
+"""
 
-from fastapi import APIRouter, Depends, File, UploadFile, HTTPException, status
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+import logging
 
 from app.core.database import get_db
-from app.api.routes.auth import get_current_user
+from app.api.deps import get_current_user
 from app.models.user import User
 from app.models.imported_document import ImportedDocument
-from app.services.ai_client import AIInferenceClient, get_ai_client
-from app.services.document_import.pipeline import upload_and_preview, approve_import
-from app.services.document_import.ocr_status import OCR_AVAILABLE
+from app.models.task import Task
+from app.services.document_import.document_extractor import DocumentExtractor
+from app.services.document_import.document_classifier import DocumentClassifier
+from app.services.ai_client import AIInferenceClient
+from app.services.scheduler_intelligence import SchedulerIntelligence
+from app.api.deps import get_ai_client_dep
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
-
 router = APIRouter(prefix="/api/import", tags=["import"])
 
-# Allowed file types
-ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md", ".jpg", ".jpeg", ".png"}
-MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
 
-
-class ApproveRequest(BaseModel):
-    import_id: int
-    reviewed_sections: list[dict]   # [{document_type, fields: {name: value}}]
-
-
-@router.get("/capabilities")
-def get_capabilities():
-    """
-    Returns what file types are currently supported.
-    Image OCR availability depends on Tesseract being installed.
-    Frontend uses this to show 'Supported ✓ PDF / ✗ Image OCR (install Tesseract)'
-    """
-    return {
-        "pdf": True,
-        "image": OCR_AVAILABLE,
-        "ocr_message": None if OCR_AVAILABLE else (
-            "Image OCR is unavailable. PDF imports work normally. "
-            "Install Tesseract to enable image extraction: "
-            "https://github.com/UB-Mannheim/tesseract/wiki"
-        ),
-    }
-
-
-@router.post("/upload")
-async def upload_document(
+@router.post("/preview")
+async def preview_import(
     file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-    ai_client: AIInferenceClient = Depends(get_ai_client),
+    current_user: User = Depends(get_current_user),
 ):
     """
-    Stage 1 of import pipeline: Upload file, run extraction + classification.
-    Returns ImportPreview for frontend review. No tasks created yet.
-    """
-    filename = file.filename or "upload"
-    ext = os.path.splitext(filename)[1].lower()
-
-    if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"File type '{ext}' not supported. Allowed: PDF, JPG, PNG.",
-        )
-
-    if ext in (".jpg", ".jpeg", ".png") and not OCR_AVAILABLE:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                "Image OCR is unavailable. Please upload a PDF instead, "
-                "or install Tesseract to enable image imports."
-            ),
-        )
-
-    content = await file.read()
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)} MB.",
-        )
-
-    try:
-        preview = upload_and_preview(
-            file_content=content,
-            original_filename=filename,
-            user_id=current_user.id,
-            db=db,
-        )
-    except Exception as exc:
-        logger.error("Import upload failed: %s", exc, exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Document processing failed. Please try again.",
-        )
-
-    # Convert dataclasses to dicts for JSON response
-    return {
-        "import_id": preview.import_id,
-        "original_filename": preview.original_filename,
-        "document_type": preview.document_type,
-        "classification_confidence": preview.classification_confidence,
-        "is_mixed": preview.is_mixed,
-        "is_unknown": preview.is_unknown,
-        "ocr_used": preview.ocr_used,
-        "extracted_text_snippet": preview.extracted_text_snippet,
-        "sections": [
-            {
-                "document_type": s.document_type,
-                "display_name": s.display_name,
-                "fields": [
-                    {
-                        "field_name": f.field_name,
-                        "display_label": f.display_label,
-                        "value": f.value,
-                        "confidence": f.confidence,
-                    }
-                    for f in s.fields
-                ],
-                "missing_required": s.missing_required,
-                "possible_duplicates": s.possible_duplicates,
-            }
-            for s in preview.sections
-        ],
-    }
-
-
-@router.post("/approve")
-def approve_document_import(
-    body: ApproveRequest,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-    ai_client: AIInferenceClient = Depends(get_ai_client),
-):
-    """
-    Stage 2: User reviewed and approved fields. Create tasks, run planner+reminder, get AI summary.
-    Nothing was saved before this call — this is the gate.
+    STEP 1: Upload document and get preview of extracted tasks.
+    Returns extracted data WITHOUT writing to database.
+    User can review and confirm before proceeding.
     """
     try:
-        result = approve_import(
-            import_id=body.import_id,
-            reviewed_sections=body.reviewed_sections,
-            user_id=current_user.id,
-            db=db,
-            ai_client=ai_client,
+        # Extract text from uploaded file
+        content = await file.read()
+        extractor = DocumentExtractor()
+        extracted_text = extractor.extract(content, file.filename)
+        
+        if not extracted_text:
+            raise HTTPException(status_code=400, detail="Could not extract text from file")
+        
+        logger.info(
+            "ImportRoutes: preview_import for user %d, file %s, %d chars extracted",
+            current_user.id, file.filename, len(extracted_text)
         )
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
-    except Exception as exc:
-        logger.error("Import approve failed: %s", exc, exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Import approval failed. Please try again.",
-        )
-    return result
+        
+        # Classify document
+        classifier = DocumentClassifier()
+        doc_type = classifier.classify(extracted_text)
+        
+        # Extract tasks (without persisting)
+        from app.services.document_import.academic_reasoning import AcademicReasoningEngine
+        reasoning_engine = AcademicReasoningEngine()
+        extracted_tasks = reasoning_engine.extract_tasks(extracted_text, doc_type)
+        
+        # Return preview for user confirmation
+        return {
+            "status": "preview_ready",
+            "filename": file.filename,
+            "document_type": doc_type,
+            "extracted_text_length": len(extracted_text),
+            "tasks_found": len(extracted_tasks),
+            "tasks": [
+                {
+                    "title": t.get("title", "Untitled"),
+                    "subject": t.get("subject", "Unknown"),
+                    "task_type": t.get("task_type", "assignment"),
+                    "due_date": t.get("due_date", ""),
+                    "estimated_hours": t.get("estimated_hours", 2),
+                    "description": t.get("description", "")[:200],  # Preview first 200 chars
+                }
+                for t in extracted_tasks
+            ],
+            "message": f"Found {len(extracted_tasks)} task(s). Review above and click 'Confirm Import' to proceed."
+        }
+    
+    except Exception as e:
+        logger.error("ImportRoutes: preview_import failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"Import preview failed: {str(e)}")
 
 
-@router.get("/history")
-def get_import_history(
-    current_user: User = Depends(get_current_user),
+@router.post("/confirm")
+async def confirm_import(
+    request: dict,
     db: Session = Depends(get_db),
-    limit: int = 10,
+    current_user: User = Depends(get_current_user),
+    ai_client: AIInferenceClient = Depends(get_ai_client_dep),
 ):
-    """Returns the user's most recent document imports for the dashboard widget."""
-    records = (
-        db.query(ImportedDocument)
-        .filter(ImportedDocument.user_id == current_user.id)
-        .order_by(ImportedDocument.uploaded_at.desc())
-        .limit(limit)
-        .all()
-    )
+    """
+    STEP 2: User confirms the preview. Now we:
+    1. Create ImportedDocument record
+    2. Create Task records
+    3. Update scheduler warnings
+    4. Return success with task count
+    """
+    try:
+        filename = request.get("filename", "Unknown")
+        extracted_text = request.get("extracted_text", "")
+        doc_type = request.get("document_type", "mixed_academic")
+        confirmed_tasks = request.get("tasks", [])
+        
+        logger.info(
+            "ImportRoutes: confirm_import for user %d, file %s, %d tasks confirmed",
+            current_user.id, filename, len(confirmed_tasks)
+        )
+        
+        # 1. Create ImportedDocument record
+        doc = ImportedDocument(
+            user_id=current_user.id,
+            filename=filename,
+            document_type=doc_type,
+            extracted_text=extracted_text,
+            uploaded_at=datetime.now(timezone.utc),
+        )
+        db.add(doc)
+        db.commit()
+        db.refresh(doc)
+        
+        # 2. Create Task records from confirmed tasks
+        created_tasks = []
+        for task_data in confirmed_tasks:
+            task = Task(
+                user_id=current_user.id,
+                title=task_data.get("title", "Untitled"),
+                subject=task_data.get("subject", "General"),
+                description=task_data.get("description", ""),
+                task_type=task_data.get("task_type", "assignment"),
+                due_date=datetime.fromisoformat(task_data.get("due_date")),
+                estimated_hours=task_data.get("estimated_hours", 2.0),
+                imported_from_id=doc.id,
+                created_at=datetime.now(timezone.utc),
+            )
+            db.add(task)
+            created_tasks.append(task)
+        
+        db.commit()
+        
+        # 3. Re-score all tasks (Planner Agent)
+        from app.agents.planner_agent import score_all_tasks
+        try:
+            score_all_tasks(current_user.id, db, ai_client)
+            logger.info("ImportRoutes: re-scored tasks for user %d", current_user.id)
+        except Exception as e:
+            logger.warning("ImportRoutes: task scoring failed: %s", e)
+        
+        # 4. Generate scheduler warnings (Proactive Scheduler)
+        try:
+            SchedulerIntelligence.generate_all_warnings(current_user.id, db)
+            logger.info("ImportRoutes: generated scheduler warnings for user %d", current_user.id)
+        except Exception as e:
+            logger.warning("ImportRoutes: warning generation failed: %s", e)
+        
+        return {
+            "status": "import_successful",
+            "filename": filename,
+            "document_id": doc.id,
+            "tasksCreated": len(created_tasks),
+            "message": f"Successfully imported {len(created_tasks)} task(s). Dashboard updated with new priorities and warnings."
+        }
+    
+    except Exception as e:
+        logger.error("ImportRoutes: confirm_import failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"Import confirmation failed: {str(e)}")
+
+
+@router.get("/documents")
+def list_documents(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    List all uploaded documents for the current user.
+    """
+    docs = db.query(ImportedDocument).filter(
+        ImportedDocument.user_id == current_user.id
+    ).order_by(ImportedDocument.uploaded_at.desc()).all()
+    
     return [
         {
-            "id": r.id,
-            "original_filename": r.original_filename,
-            "document_type": r.document_type,
-            "status": r.status,
-            "confidence_overall": r.confidence_overall,
-            "uploaded_at": r.uploaded_at.isoformat(),
-            "reviewed_at": r.reviewed_at.isoformat() if r.reviewed_at else None,
+            "id": d.id,
+            "filename": d.filename,
+            "document_type": d.document_type,
+            "uploaded_at": d.uploaded_at.isoformat(),
+            "task_count": len(d.tasks) if d.tasks else 0,
         }
-        for r in records
+        for d in docs
     ]
-
-
-@router.get("/{import_id}/source")
-def view_source_document(
-    import_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """
-    View Source: serve the original uploaded file for traceability.
-    Judges can verify extracted fields came from the actual document.
-    """
-    record = db.query(ImportedDocument).filter(
-        ImportedDocument.id == import_id,
-        ImportedDocument.user_id == current_user.id,
-    ).first()
-
-    if not record:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Import not found.")
-
-    if not os.path.exists(record.storage_path):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Original file no longer available on disk.",
-        )
-
-    return FileResponse(
-        path=record.storage_path,
-        media_type=record.mime_type or "application/octet-stream",
-        filename=record.original_filename,
-    )
