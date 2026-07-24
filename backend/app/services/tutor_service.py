@@ -1,5 +1,5 @@
 """
-services/tutor_service.py — AI Tutor workflow service with 4-dimensional prompt composition.
+services/tutor_service.py — AI Tutor workflow service with 6-knob behavior engine.
 """
 
 import json
@@ -14,6 +14,7 @@ from app.models.study_note import StudyNote
 from app.models.mistake_journal import MistakeJournal
 from app.models.learning_profile import LearningProfile
 from app.services.ai_client import AIInferenceClient
+from app.services.tutor_behavior_engine import TutorBehaviorEngine, TutorConfiguration
 
 
 def build_mermaid_diagram(diagram_data: dict) -> str:
@@ -44,10 +45,14 @@ def build_mermaid_diagram(diagram_data: dict) -> str:
     return "\n".join(lines)
 
 
-def get_or_create_objectives(db: Session, subject: str, topic: str) -> list[LearningObjective]:
+def get_or_create_objectives(db: Session, subject: str, topic: str, user_id: int) -> list:
     """Retrieves and merges objectives for a topic, assigning priorities (1-5 stars)."""
     objectives = db.query(LearningObjective).filter(
-        and_(LearningObjective.subject == subject, LearningObjective.topic == topic)
+        and_(
+            LearningObjective.user_id == user_id,
+            LearningObjective.subject == subject,
+            LearningObjective.topic == topic
+        )
     ).all()
 
     if not objectives:
@@ -61,6 +66,7 @@ def get_or_create_objectives(db: Session, subject: str, topic: str) -> list[Lear
         objectives = []
         for text, stars in core_texts:
             obj = LearningObjective(
+                user_id=user_id,
                 subject=subject,
                 topic=topic,
                 objective_text=text,
@@ -72,74 +78,6 @@ def get_or_create_objectives(db: Session, subject: str, topic: str) -> list[Lear
         db.commit()
         
     return objectives
-
-
-def compose_tutor_prompt(
-    personality: str,
-    learning_mode: str,
-    assessment_format: str,
-    study_focus: str,
-    topic: str,
-    user_answer: str = ""
-) -> str:
-    """
-    Composes a modular 4-dimensional system prompt that enforces distinct:
-    - system prompt
-    - tone
-    - response structure
-    - question format
-    - difficulty
-    - evaluation behaviour
-    """
-    personality_modifiers = {
-        "Socratic Tutor": "Never give the answer directly. Ask probing questions that guide the student to discover the answer themselves. Only confirm correctness when they reach the right conclusion.",
-        "Professor": "Give formal, structured, detailed explanations. Use academic language. Always reference theory before examples. Maintain strict academic tone throughout.",
-        "Friendly Teacher": "Use simple everyday language. Give relatable real-world examples. Celebrate correct answers enthusiastically. Correct mistakes gently.",
-        "Interviewer": "Ask one question at a time. Do not teach. Do not hint. Evaluate answers exactly as a senior interviewer would. After each answer give structured feedback.",
-        "Exam Coach": "Focus on marks, speed, and exam technique. Always point out what examiners look for. Be direct and efficiency-focused."
-    }
-
-    mode_instructions = {
-        "Teach Me": "First explain the concept fully with examples. Then ask one question to verify understanding. ALWAYS start with explanation. Never start with a question.",
-        "Test Me": "Present the question immediately. No explanation until after the answer is submitted. ALWAYS start with the question. Never explain before the answer.",
-        "Challenge Me": "Only application-level questions. Multi-step reasoning required. Real-world scenario based. No basic definition or recall questions.",
-        "Revise": "Load weak topics and previously wrong answers first. Give summaries not full explanations. Focus on memory reinforcement.",
-        "Interview Me": "One question at a time. Wait for complete answer. No hints under any circumstances. Give structured interview feedback after answer."
-    }
-
-    format_instructions = {
-        "Multiple Choice": "Format every question as: Q: [question]\nA) [option]\nB) [option]\nC) [option]\nD) [option]",
-        "MCQ": "Format every question as: Q: [question]\nA) [option]\nB) [option]\nC) [option]\nD) [option]",
-        "True/False": "Format every question as: Statement: [statement]\nTrue or False?",
-        "Short Answer": "Expect one sentence to one paragraph. Evaluate whether key concepts are present.",
-        "Mixed": "Rotate between MCQ, True/False, and Short Answer."
-    }
-
-    focus_instructions = {
-        "GATE": "High difficulty. Include numerical and competitive questions. Strict evaluation. Follow GATE patterns.",
-        "Placement": "Scenario-based questions. Interview-ready structured answers. Application and real-world focused.",
-        "Interview": "Full interview simulation. Mix HR and technical questions. Give professional structured feedback.",
-        "College Exam": "University syllabus level. Theory plus standard problems. Include typical exam patterns.",
-        "Semester": "University syllabus level. Theory plus standard problems.",
-        "Mid Exam": "University syllabus level. Theory plus standard problems.",
-        "General Learning": "Relaxed pace. Broader exploration. No time pressure. Encouraging and supportive tone."
-    }
-
-    p_mod = personality_modifiers.get(personality, personality_modifiers["Socratic Tutor"])
-    m_ins = mode_instructions.get(learning_mode, mode_instructions["Teach Me"])
-    f_ins = format_instructions.get(assessment_format, format_instructions["Mixed"])
-    g_ins = focus_instructions.get(study_focus, focus_instructions["General Learning"])
-
-    return f"""
-System Prompt Configuration:
-- Personality: {personality} ({p_mod})
-- Mode: {learning_mode} ({m_ins})
-- Format: {assessment_format} ({f_ins})
-- Focus: {study_focus} ({g_ins})
-
-Topic: {topic}
-Student Input: {user_answer}
-"""
 
 
 class TutorService:
@@ -155,12 +93,20 @@ class TutorService:
         target_goal: str,
         teacher_personality: str,
         learning_mode: str,
+        session_length_minutes: int = 60,
         document_id: int = None
     ) -> TutorSession:
-        get_or_create_objectives(db, subject, topic)
+        """
+        Initialize a tutor session with 6-knob configuration.
+        """
+        get_or_create_objectives(db, subject, topic, user_id)
 
         profile = db.query(LearningProfile).filter(
-            and_(LearningProfile.user_id == user_id, LearningProfile.subject == subject, LearningProfile.topic == topic)
+            and_(
+                LearningProfile.user_id == user_id,
+                LearningProfile.subject == subject,
+                LearningProfile.topic == topic
+            )
         ).first()
         
         starting_diff = difficulty_level
@@ -208,10 +154,31 @@ class TutorService:
                 learning_objs = blk.get("learning_objectives", [])
                 question_bank = blk.get("question_bank", [])
 
+        # Build 6-knob configuration
+        config = TutorConfiguration(
+            personality=teacher_personality,
+            learning_mode=learning_mode,
+            assessment_format=assessment_type,
+            study_focus=target_goal,
+            difficulty_level=starting_diff or 1,
+            session_length_minutes=session_length_minutes,
+        )
+
+        # Validate configuration
+        is_valid, errors = TutorBehaviorEngine.validate_configuration(config)
+        if not is_valid:
+            raise ValueError(f"Invalid tutor configuration: {errors}")
+
+        # Compose system prompt using behavior engine
+        system_prompt = TutorBehaviorEngine.compose_tutor_prompt(
+            config, topic, ""
+        )
+
+        # Generate initial tutor message using AI
         prompt_ctx = {
             "subject": subject,
             "topic": topic,
-            "difficulty_level": session.difficulty_level,
+            "difficulty_level": starting_diff or 1,
             "target_goal": target_goal,
             "teacher_personality": teacher_personality,
             "learning_mode": learning_mode,
@@ -222,16 +189,21 @@ class TutorService:
             "definitions": definitions,
             "examples": examples,
             "learning_objectives": learning_objs,
-            "question_bank": question_bank
+            "question_bank": question_bank,
+            "system_prompt": system_prompt,
         }
         
-        init_reply = ai_client.generate("tutor_init_prompt", prompt_ctx)
+        try:
+            init_reply = ai_client.generate("tutor_init_prompt", prompt_ctx)
+        except Exception as e:
+            # Fallback if AI service fails
+            init_reply = f"Starting {teacher_personality} session on {topic}. Let's begin!"
         
         msg = TutorMessage(
             session_id=session.id,
             role="assistant",
             content=init_reply,
-            evaluation_confidence=100.0
+            evaluation_confidence=95.0
         )
         db.add(msg)
         db.commit()
@@ -246,6 +218,9 @@ class TutorService:
         student_answer: str,
         time_taken_seconds: int
     ) -> dict:
+        """
+        Evaluate student answer and respond using 6-knob configuration.
+        """
         session = db.query(TutorSession).filter(TutorSession.id == session_id).first()
         if not session:
             return {"error": "Session not found"}
@@ -296,7 +271,6 @@ class TutorService:
         definitions = []
         examples = []
         from app.models.imported_document import ImportedDocument
-        # Find latest document matching subject/user
         doc = db.query(ImportedDocument).filter(
             and_(ImportedDocument.user_id == session.user_id)
         ).order_by(ImportedDocument.uploaded_at.desc()).first()
@@ -308,6 +282,20 @@ class TutorService:
             topic_keywords = blk.get("keywords", [])
             definitions = blk.get("definitions", [])
             examples = blk.get("examples", [])
+
+        # Build configuration for evaluation
+        config = TutorConfiguration(
+            personality=session.teacher_personality,
+            learning_mode=session.learning_mode,
+            assessment_format=session.assessment_type,
+            study_focus=session.target_goal,
+            difficulty_level=session.difficulty_level,
+            session_length_minutes=60,  # Can vary based on session tracking
+        )
+
+        # Compose evaluation prompt
+        eval_prompt = TutorBehaviorEngine.compose_tutor_prompt(config, session.topic, student_answer)
+        rubric = TutorBehaviorEngine.build_evaluation_rubric(config)
 
         eval_ctx = {
             "subject": session.subject,
@@ -325,15 +313,17 @@ class TutorService:
             "topic_summary": topic_summary,
             "topic_keywords": topic_keywords,
             "definitions": definitions,
-            "examples": examples
+            "examples": examples,
+            "system_prompt": eval_prompt,
+            "evaluation_rubric": rubric,
         }
 
         # 3. Call AI Inference for Semantic Grading and response
-        evaluation_raw = ai_client.generate("tutor_evaluate_response", eval_ctx)
-        
         try:
+            evaluation_raw = ai_client.generate("tutor_evaluate_response", eval_ctx)
             eval_data = json.loads(evaluation_raw)
-        except Exception:
+        except Exception as e:
+            # Fallback evaluation
             eval_data = {
                 "understanding": 75,
                 "reasoning": 70,
@@ -469,7 +459,8 @@ class TutorService:
             "misconceptions": eval_data.get("misconceptions", []),
             "mermaid_code": mermaid_code,
             "difficulty_level": session.difficulty_level,
-            "mastery_score": profile.mastery
+            "mastery_score": profile.mastery,
+            "configuration": config.to_dict(),
         }
 
     @staticmethod
